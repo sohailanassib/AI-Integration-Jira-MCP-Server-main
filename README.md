@@ -9,6 +9,14 @@ A Model Context Protocol (MCP) server for integrating Jira Cloud with Zephyr Sca
 - **Zephyr Scale Integration** — Push generated test cases to Zephyr Scale and link them to Jira stories for full traceability.
 - **Bug Creation from Test Failures** — When a Zephyr test case fails, auto-create a Jira bug with steps to reproduce, and link it to both the story and the test case.
 
+## Screenshots
+
+![CI Test Cases Generation](Screenshot%202026-07-25%20at%207.08.44%E2%80%AFPM.png)
+*CI Test Cases Generation*
+
+![Feature Test Cases Generation](Screenshot%202026-07-25%20at%207.08.10%E2%80%AFPM.png)
+*Feature Test Cases Generation*
+
 ## Tools
 
 | Tool | Description |
