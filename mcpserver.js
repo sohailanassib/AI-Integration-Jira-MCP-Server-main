@@ -1,21 +1,23 @@
-
 #!/usr/bin/env node
 
 /**
  * Jira MCP Server
  *
- * A simple Model Context Protocol (MCP) server that lets an AI assistant
+ * A Model Context Protocol (MCP) server that lets an AI assistant
  * (like Claude Desktop or Cursor) talk to Jira Cloud: search issues,
- * read issue details, create issues, update issues, and add/read comments.
+ * read issue details, create issues, update issues, add/read comments,
+ * and generate AI-powered test cases from a story's description.
  *
  * Setup:
- *   npm install @modelcontextprotocol/sdk node-fetch
+ *   npm install @modelcontextprotocol/sdk node-fetch @anthropic-ai/sdk
  *
  * Environment variables (required, put them in a .env file):
- *   JIRA_BASE_URL   - e.g. https://yourcompany.atlassian.net
- *   JIRA_EMAIL      - your Atlassian account email
- *   JIRA_API_TOKEN  - your Atlassian API token
- *                     (generate at https://id.atlassian.com/manage-profile/security/api-tokens)
+ *   JIRA_BASE_URL      - e.g. https://yourcompany.atlassian.net
+ *   JIRA_EMAIL         - your Atlassian account email
+ *   JIRA_API_TOKEN     - your Atlassian API token
+ *                        (generate at https://id.atlassian.com/manage-profile/security/api-tokens)
+ *   ANTHROPIC_API_KEY  - your Anthropic API key (used by create_test_cases)
+ *                        (get one at https://console.anthropic.com)
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -25,17 +27,21 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import fetch from "node-fetch";
+import Anthropic from "@anthropic-ai/sdk";
 
 // ─── Config ───────────────────────────────────────────────────────────────
 
-const JIRA_BASE_URL  = process.env.JIRA_BASE_URL?.replace(/\/$/, "");
-const JIRA_EMAIL     = process.env.JIRA_EMAIL;
-const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
+const JIRA_BASE_URL     = process.env.JIRA_BASE_URL?.replace(/\/$/, "");
+const JIRA_EMAIL        = process.env.JIRA_EMAIL;
+const JIRA_API_TOKEN    = process.env.JIRA_API_TOKEN;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 if (!JIRA_BASE_URL || !JIRA_EMAIL || !JIRA_API_TOKEN) {
   console.error("Missing required env vars: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN");
   process.exit(1);
 }
+
+const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 
 const JIRA_AUTH_HEADER =
   "Basic " + Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64");
@@ -146,6 +152,26 @@ const TOOLS = [
       type: "object",
       properties: {
         issueKey: { type: "string", description: "The Jira issue key, e.g. PROJ-123" },
+      },
+      required: ["issueKey"],
+    },
+  },
+  {
+    name: "create_test_cases",
+    description:
+      "Fetch a Jira story by key, read its summary and description, then use AI " +
+      "to generate positive, negative, and edge test cases for it.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueKey: {
+          type: "string",
+          description: "The Jira issue key of the story, e.g. PROJ-123.",
+        },
+        additionalContext: {
+          type: "string",
+          description: "Optional extra instructions for test generation, e.g. 'Focus on mobile scenarios'.",
+        },
       },
       required: ["issueKey"],
     },
@@ -272,6 +298,65 @@ async function handleGetComments({ issueKey }) {
   return { issueKey, total: data.total, comments };
 }
 
+// ─── AI test case generation ────────────────────────────────────────────────
+
+async function handleCreateTestCases({ issueKey, additionalContext = "" }) {
+  if (!anthropic) {
+    throw new Error("ANTHROPIC_API_KEY is not set — required for create_test_cases.");
+  }
+
+  const issue = await jiraRequest("GET", `/issue/${issueKey}`);
+  const f = issue.fields;
+
+  const summary     = f.summary || "";
+  const description = extractTextFromADF(f.description);
+
+  const systemPrompt = `You are a QA engineer. Generate test cases based on a Jira user story.
+Return ONLY valid JSON — no markdown fences, no explanation outside the JSON.
+
+Return a JSON array of test case objects with this exact shape:
+[
+  {
+    "title": "Short descriptive TC title",
+    "type": "positive" | "negative" | "edge",
+    "steps": [
+      { "step": "Action to perform", "expectedResult": "What should happen" }
+    ]
+  }
+]
+
+Rules:
+- At minimum: 2 positive, 2 negative, 1 edge case.
+- Steps should be clear, atomic, and independently executable.`;
+
+  const userPrompt = `
+Story Key: ${issueKey}
+Summary:   ${summary}
+
+Description:
+${description || "(No description provided)"}
+
+${additionalContext ? `Additional context: ${additionalContext}` : ""}`;
+
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 2000,
+    system: systemPrompt,
+    messages: [{ role: "user", content: userPrompt }],
+  });
+
+  const raw = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("")
+    .trim()
+    .replace(/^```json\s*|\s*```$/g, "");
+
+  const testCases = JSON.parse(raw);
+
+  return { issueKey, summary, total: testCases.length, testCases };
+}
+
 // ─── ADF helpers ────────────────────────────────────────────────────────────
 // Jira Cloud stores rich text (descriptions, comments) in a format called
 // ADF (Atlassian Document Format) instead of plain strings. These two
@@ -328,6 +413,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "jira_update_issue":  result = await handleUpdateIssue(args);  break;
       case "jira_add_comment":   result = await handleAddComment(args);   break;
       case "jira_get_comments":  result = await handleGetComments(args);  break;
+      case "create_test_cases":  result = await handleCreateTestCases(args); break;
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
